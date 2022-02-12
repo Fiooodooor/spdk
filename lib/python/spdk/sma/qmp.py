@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import errno
 import socket
 from socket import error as SocketError
 import json
@@ -43,9 +44,9 @@ class QMPRequestError(QMPError):
     Exception Class for handling request response errors
     '''
     def __init__(self, reply: QMPMessage):
-        error_class = reply.get('error', {}).get('class', 'Undefined')
-        error_msg = reply.get('error', {}).get('desc', 'Unknown')
-        super().__init__(error_msg, error_class)
+        self.error_class = reply.get('error', {}).get('class', 'Undefined')
+        self.error_msg = reply.get('error', {}).get('desc', 'Unknown')
+        super().__init__(self.error_class, self.error_class)
 
 
 class QMPClient():
@@ -180,6 +181,15 @@ class QMPClient():
     def exec_device_del(self, dev_uuid: str):
         qmp_params = {"id": dev_uuid}
         self.exec('device_del', qmp_params)
+        
+    def exec_device_list_properties(self, dev_uuid: str):
+        qmp_params = {"typename": dev_uuid}
+        try:
+            self.exec('device-list-properties', qmp_params)
+        except QMPRequestError as err:
+            if err.error_class == "DeviceNotFound":
+                return None
+            raise err
 
 
 def parse_argv():

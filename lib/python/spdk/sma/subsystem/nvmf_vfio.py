@@ -1,13 +1,14 @@
 import logging
-import tempfile
+import os
 import re
+from time import sleep
 import grpc
 from spdk.rpc.client import JSONRPCException
 from google.protobuf import wrappers_pb2 as wrap
 from .subsystem import Subsystem, SubsystemException
 from ..proto import sma_pb2
 from ..proto import nvmf_vfio_pb2
-from ..qmp import QMPClient
+from ..qmp import QMPClient, QMPError
 
 log = logging.getLogger(__name__)
 
@@ -22,6 +23,7 @@ class NvmfVfioSubsystem(Subsystem):
     def __init__(self, client):
         super().__init__('nvmf_vfio', client)
         self._trtype = 'vfiouser'
+        self._root_path = '/var/run/vfio-user/sma'
         self._controllers = {}
         self._has_transport = self._create_transport()
 
@@ -30,9 +32,47 @@ class NvmfVfioSubsystem(Subsystem):
     
     def _get_trtype(self):
         return self._trtype
+    
+    def _prefix_add(self, nqn):
+        return f'{self._get_name()}:{nqn}'
+        
+    def _prefix_rem(self, nqn):
+        return nqn.removeprefix(f'{self._get_name()}:')
+    
+    def _get_id_from_nqn(self, nqn):
+        return re.sub("[^0-9a-zA-Z]+", "1", nqn)
 
-    def _create_socket_path(self):
-        return tempfile.TemporaryDirectory()
+    def _get_path_from_id(self, id):
+        return os.path.join(self._root_path, id)
+
+    def _get_path_from_nqn(self, nqn):
+        id = self._get_id_from_nqn(nqn)
+        return self._get_path_from_id(id)
+
+    def _create_socket_path(self, id):
+        socket_pth = self._get_path_from_id(id)
+        try:
+            if not os.path.exists(socket_pth):
+                os.makedirs(socket_pth)
+            return socket_pth
+        except OSError as e:
+            raise NvmfVfioException(
+                        grpc.StatusCode.INTERNAL,
+                        'Path creation failed.', socket_pth) from e
+
+    def _remove_socket_path(self, id):
+        socket_pth = self._get_path_from_id(id)
+        bar = os.path.join(socket_pth, 'bar0')
+        cntrl = os.path.join(socket_pth, 'cntrl')
+        try:
+            if os.path.exists(bar):
+                os.remove(bar)
+            if os.path.exists(cntrl):
+                os.remove(cntrl)
+        except OSError as e:
+            raise NvmfVfioException(
+                        grpc.StatusCode.INTERNAL,
+                        'Path deletion failed.', socket_pth) from e
 
     def _create_transport(self):
         try:
@@ -49,12 +89,19 @@ class NvmfVfioSubsystem(Subsystem):
             return False
 
     def _unpack_request(self, request):
-        params = self._subsys_proto.CreateDeviceParameters()
+        params = nvmf_vfio_pb2.CreateDeviceParameters()
         if not request.params.Unpack(params):
                 raise NvmfVfioException(
                             grpc.StatusCode.INTERNAL,
                             'Failed to unpack request', request)
         return params
+    
+    def _check_params(self, request, params):
+        for param in params:
+            if not request.HasField(param):
+                raise NvmfVfioException(
+                            grpc.StatusCode.INTERNAL,
+                            'Could not find param', request)
 
     def _to_low_case_set(self, dict_in) -> set:
         '''
@@ -128,10 +175,60 @@ class NvmfVfioSubsystem(Subsystem):
                     "Failed to create listener", args)
 
     def create_device(self, request):
-        raise NotImplementedError()
+        params = self._unpack_request(request)
+        self._check_params(params, ['trbus', 'qtraddr', 'qtrsvcid'])
+        nqn = params.subnqn.value
+        id = self._get_id_from_nqn(nqn)
+        traddr = self._create_socket_path(id)
+        addr = { 'traddr': traddr,
+                 'trtype': self._get_trtype() }
+
+        trbus = params.trbus.value
+        qaddress = (params.qtraddr.value, int(params.qtrsvcid.value))
+        try:
+            with self._client() as client:
+                subsys_created = self._check_create_subsystem(client, nqn)
+                if not self._check_listener(client, nqn, addr):
+                    self._create_listener(client, nqn, addr, subsys_created)
+            with QMPClient(qaddress) as qclient:
+                if not qclient.exec_device_list_properties(id):
+                    qclient.exec_device_add(addr['traddr'], trbus, id)
+        except JSONRPCException as e:
+            raise NvmfVfioException(
+                grpc.StatusCode.INTERNAL,
+                "JSONRPCException failed to create device", params) from e
+        except QMPError as e:
+            # TODO: subsys and listener cleanup
+            raise NvmfVfioException(
+                grpc.StatusCode.INTERNAL,
+                "QMPClient failed to create device", params) from e
+        return sma_pb2.CreateDeviceResponse(id=wrap.StringValue(
+                    value=self._prefix_add(nqn)))
 
     def remove_device(self, request):
-        raise NotImplementedError()
+        try:
+            with self._client() as client:
+                nqn = self._prefix_rem(request.id.value)
+                id = self._get_id_from_nqn(nqn)
+                if self._get_subsystem_by_nqn(client, nqn) is not None:
+                    with QMPClient() as qclient:
+                        qclient.exec_device_del(id)
+                        sleep(1)
+                    if not client.call('nvmf_delete_subsystem', {'nqn': nqn}):
+                        raise NvmfVfioException(
+                            grpc.StatusCode.INTERNAL,
+                            "Failed to remove device", id)
+                    self._remove_socket_path(id)
+                else:
+                    logging.info(f'Tried to remove a non-existing device: {nqn}')
+        except JSONRPCException as e:
+            raise NvmfVfioException(
+                grpc.StatusCode.INTERNAL,
+                "JSONRPCException failed to delete device", request) from e
+        except QMPError as e:
+            raise NvmfVfioException(
+                grpc.StatusCode.INTERNAL,
+                "QMPClient failed to delete device", request) from e
 
     def connect_volume(self, request):
         raise NotImplementedError()
@@ -146,7 +243,7 @@ class NvmfVfioSubsystem(Subsystem):
         raise NotImplementedError()
 
     def owns_device(self, id):
-        raise NotImplementedError()
+        return id.startswith(self._get_name())
 
     def owns_controller(self, id):
-        return id.startswith(self._get_name())
+        raise NotImplementedError()
