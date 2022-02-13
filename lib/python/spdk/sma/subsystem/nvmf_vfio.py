@@ -1,6 +1,7 @@
 import logging
 import re
 import os
+from time import sleep
 import grpc
 from spdk.rpc.client import JSONRPCException
 from google.protobuf import wrappers_pb2 as wrap
@@ -58,6 +59,20 @@ class NvmfVfioSubsystem(Subsystem):
             raise NvmfVfioException(
                         grpc.StatusCode.INTERNAL,
                         'Path creation failed.', socket_pth) from e
+
+    def _remove_socket_path(self, id):
+        socket_pth = self._get_path_from_id(id)
+        bar = os.path.join(socket_pth, 'bar0')
+        cntrl = os.path.join(socket_pth, 'cntrl')
+        try:
+            if os.path.exists(bar):
+                os.remove(bar)
+            if os.path.exists(cntrl):
+                os.remove(cntrl)
+        except OSError as e:
+            raise NvmfVfioException(
+                        grpc.StatusCode.INTERNAL,
+                        'Path deletion failed.', socket_pth) from e
 
     def _create_transport(self):
         try:
@@ -192,7 +207,31 @@ class NvmfVfioSubsystem(Subsystem):
                     value=self._prefix_add(nqn)))
 
     def remove_device(self, request):
-        raise NotImplementedError()
+        try:
+            with self._client() as client:
+                nqn = self._prefix_rem(request.id.value)
+                id = self._get_id_from_nqn(nqn)
+                if self._get_subsystem_by_nqn(client, nqn) is not None:
+                    with QMPClient() as qclient:
+                        if qclient.exec_device_list_properties(id):
+                            qclient.exec_device_del(id)
+                            # TODO: add wait for event device deleted instead sleep
+                            sleep(1)
+                    if not client.call('nvmf_delete_subsystem', {'nqn': nqn}):
+                        raise NvmfVfioException(
+                            grpc.StatusCode.INTERNAL,
+                            "Failed to remove device", id)
+                    self._remove_socket_path(id)
+                else:
+                    logging.info(f'Tried to remove a non-existing device: {nqn}')
+        except JSONRPCException as e:
+            raise NvmfVfioException(
+                grpc.StatusCode.INTERNAL,
+                "JSONRPCException failed to delete device", request) from e
+        except QMPError as e:
+            raise NvmfVfioException(
+                grpc.StatusCode.INTERNAL,
+                "QMPClient failed to delete device", request) from e
 
     def connect_volume(self, request):
         raise NotImplementedError()
