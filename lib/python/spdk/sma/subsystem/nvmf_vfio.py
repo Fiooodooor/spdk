@@ -2,6 +2,7 @@ import logging
 import re
 import os
 from time import sleep
+import uuid
 import grpc
 from spdk.rpc.client import JSONRPCException
 from google.protobuf import wrappers_pb2 as wrap
@@ -88,8 +89,36 @@ class NvmfVfioSubsystem(Subsystem):
             logging.error(f'Transport query NVMe/{self._get_trtype()} failed')
             return False
 
-    def _unpack_request(self, request):
-        params = nvmf_vfio_pb2.CreateDeviceParameters()
+    def _add_volume(self, ctrlr_name, volume_guid):
+        volumes = self._controllers.get(ctrlr_name, [])
+        if volume_guid in volumes:
+            return
+        self._controllers[ctrlr_name] = volumes + [volume_guid]
+
+    def _get_vfio_controllers(self, controllers):
+        for controller in controllers:
+            if next(filter(lambda c: c.get('trid', {}).get('trtype', '').lower() == self._get_trtype(),
+                           controller['ctrlrs']), None) is not None:
+                yield controller
+
+    def _cache_controllers(self, controllers):
+        for controller in self._get_vfio_controllers(controllers):
+            cname = controller['name']
+            # If a controller was connected outside of our knowledge (e.g. via discovery),
+            # we'll never want to disconnect it.  To prevent from doing that, add NULL GUID
+            # acting as an extra reference.
+            if cname not in self._controllers:
+                logging.debug(f'Found external controller: {cname}')
+                self._add_volume(cname, str(uuid.UUID(int=0)))
+
+        # Now go over our cached list and remove controllers that were disconnected in the
+        # meantime, without our knowledge
+        for cname in [*self._controllers.keys()]:
+            if cname not in [c['name'] for c in self._get_vfio_controllers(controllers)]:
+                logging.debug(f'Removing disconnected controller: {cname}')
+                self._controllers.pop(cname)
+
+    def _unpack_request(self, params, request):
         if not request.params.Unpack(params):
                 raise NvmfVfioException(
                             grpc.StatusCode.INTERNAL,
@@ -126,6 +155,13 @@ class NvmfVfioSubsystem(Subsystem):
         low_case = self._to_low_case_set(addr)
         return bool(list(filter(lambda i: (low_case.issubset(
                                 self._to_low_case_set(i))), addr_list)))
+
+    def _get_bdev_by_uuid(self, client, uuid):
+        bdevs = client.call('bdev_get_bdevs')
+        for bdev in bdevs:
+            if bdev['uuid'] == uuid:
+                return bdev
+        return None
 
     def _get_subsystem_by_nqn(self, client, nqn):
         subsystems = client.call('nvmf_get_subsystems')
@@ -175,7 +211,8 @@ class NvmfVfioSubsystem(Subsystem):
                     "Failed to create listener", args)
 
     def create_device(self, request):
-        params = self._unpack_request(request)
+        params = nvmf_vfio_pb2.CreateDeviceParameters()
+        params = self._unpack_request(params, request)
         self._check_params(params, ['trbus', 'qtraddr', 'qtrsvcid'])
         nqn = params.subnqn.value
         id = self._get_id_from_nqn(nqn)
@@ -216,7 +253,7 @@ class NvmfVfioSubsystem(Subsystem):
                         if qclient.exec_device_list_properties(id):
                             qclient.exec_device_del(id)
                             # TODO: add wait for event device deleted instead sleep
-                            sleep(1)
+                            sleep(3)
                     if not client.call('nvmf_delete_subsystem', {'nqn': nqn}):
                         raise NvmfVfioException(
                             grpc.StatusCode.INTERNAL,
@@ -234,16 +271,155 @@ class NvmfVfioSubsystem(Subsystem):
                 "QMPClient failed to delete device", request) from e
 
     def connect_volume(self, request):
-        raise NotImplementedError()
+        params = nvmf_vfio_pb2.ConnectVolumeParameters()
+        params = self._unpack_request(params, request)
+        self._check_params(params, ['trbus', 'qtraddr', 'qtrsvcid'])
+        print("connecting ")
+        print(params)
+        try:
+            with self._client() as client:
+                print("entered ")
+                nqn = params.subnqn.value
+                print(f"nqn {nqn} ")
+                traddr = self._get_path_from_nqn(nqn)
+                addr = {'traddr': traddr,
+                        'trtype': self._get_trtype() }
+                existing = False
+                controllers = client.call('bdev_nvme_get_controllers')
+                print(f"controllers {controllers} ")
+
+                # First update the controller cache
+                self._cache_controllers(controllers)
+
+                for controller in self._get_vfio_controllers(controllers):
+                    for path in controller['ctrlrs']:
+                        trid = path['trid']
+                        if self._check_addr(addr, (trid,)):
+                            cname = controller['name']
+                            bdevs = client.call('bdev_get_bdevs')
+                            nbdevs = [(b['name'], b['driver_specific']['nvme'])
+                                      for b in bdevs if b.get(
+                                        'driver_specific', {}).get('nvme') is not None]
+                            names = [name for name, nvme in nbdevs if
+                                     self._check_addr(addr, [n['trid'] for n in nvme])]
+                            break
+                    else:
+                        continue
+                    existing = True
+                    break
+                else:
+                    cname = str(uuid.uuid1())
+                    print(f"else {cname} ")
+                    prms = {'name': cname,
+                            'trtype': 'rdma',
+                            'traddr': traddr,
+                            'subnqn': nqn}
+                    print(f"prms {prms} ")
+                    names = client.call('bdev_nvme_attach_controller',
+                                        prms)
+                    print(f"names {names} ")
+                    bdevs = client.call('bdev_get_bdevs')
+                    print(f"bdev_get_bdevs {bdevs} ")
+                # Check if the controller contains specified volume
+                for name in names:
+                    bdev = next(filter(lambda b: b['name'] == name, bdevs), None)
+                    print(f"bdev {bdev} name {name}")
+                    if bdev is not None and request.guid.value == bdev['uuid']:
+                        break
+                else:
+                    # Detach the controller only if we've just connected it
+                    if not existing:
+                        try:
+                            client.call('bdev_nvme_detach_controller',
+                                        {'name': cname})
+                        except JSONRPCException:
+                            pass
+                    raise SubsystemException(grpc.StatusCode.INVALID_ARGUMENT,
+                                             'Volume couldn\'t be found')
+                self._add_volume(cname, request.guid.value)
+                return sma_pb2.ConnectVolumeResponse()
+        except JSONRPCException:
+            # TODO: parse the exception's error
+            raise SubsystemException(grpc.StatusCode.INTERNAL,
+                                     'Failed to connect the volume')
 
     def disconnect_volume(self, request):
-        raise NotImplementedError()
+        try:
+            with self._client() as client:
+                controllers = client.call('bdev_nvme_get_controllers')
+                # First update the controller cache
+                self._cache_controllers(controllers)
+
+                disconnect, cname = self._remove_volume(request.guid.value)
+                if not disconnect:
+                    return cname is not None
+
+                for controller in controllers:
+                    if controller['name'] == cname:
+                        result = client.call('bdev_nvme_detach_controller',
+                                             {'name': cname})
+                        if not result:
+                            raise SubsystemException(grpc.StatusCode.INTERNAL,
+                                                     'Failed to disconnect the volume')
+                        return True
+                else:
+                    logging.info('Tried to disconnect volume fron non-existing ' +
+                                 f'controller: {cname}')
+            return False
+        except JSONRPCException:
+            # TODO: parse the exception's error
+            raise SubsystemException(grpc.StatusCode.INTERNAL,
+                                     'Failed to disconnect the volume')
 
     def attach_volume(self, request):
-        raise NotImplementedError()
+        self._check_params(request, ['volume_guid'])
+        nqn = self._prefix_rem(request.device_id.value)
+        try:
+            with self._client() as client:
+                bdev = self._get_bdev_by_uuid(request.volume_guid.value)
+                if bdev is None:
+                    raise NvmfVfioException(grpc.StatusCode.NOT_FOUND,
+                                            'Invalid volume GUID', request)
+                subsystem = self._get_subsystem_by_nqn(nqn)
+                if subsystem is None:
+                    raise NvmfVfioException(grpc.StatusCode.NOT_FOUND,
+                                            'Invalid device ID', request)
+                if bdev['name'] not in [ns['name'] for ns in subsystem['namespaces']]:
+                    params = {'nqn': nqn, 'namespace': {'bdev_name': bdev['name']}}
+                    result = client.call('nvmf_subsystem_add_ns', params)
+                    if not result:
+                        raise NvmfVfioException(grpc.StatusCode.INTERNAL,
+                                                'Failed to attach volume', params)
+        except JSONRPCException as e:
+            raise NvmfVfioException(grpc.StatusCode.INTERNAL,
+                                    'Failed to attach volume', request) from e
 
     def detach_volume(self, request):
-        raise NotImplementedError()
+        self._check_params(request, ['volume_guid', 'device_id'])
+        nqn = self._prefix_rem(request.id.value) 
+        volume = request.volume_guid.value
+        try:
+            with self._client() as client:
+                bdev = self._get_bdev_by_uuid(volume)
+                if bdev is None:
+                    logging.info(f'Tried to detach non-existing volume: {volume}')
+                    return
+                subsystem = self._get_subsystem_by_nqn(nqn)
+                if subsystem is None:
+                    logging.info(f'Tried detaching: {volume} from non-existing: {nqn}')
+                    return
+                for ns in subsystem['namespaces']:
+                    if ns['name'] != bdev['name']:
+                        continue
+                    params = {'nqn': nqn, 'nsid': ns['nsid']}
+                    result = client.call('nvmf_subsystem_remove_ns', params)
+                    if not result:
+                        raise NvmfVfioException(grpc.StatusCode.INTERNAL,
+                                                'Failed to detach volume', request)
+                    break
+        except JSONRPCException as e:
+            raise NvmfVfioException(grpc.StatusCode.INTERNAL,
+                                    'Failed to detach volume', request) from e
 
     def owns_device(self, id):
         return id.startswith(self._get_name())
